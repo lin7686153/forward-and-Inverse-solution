@@ -54,14 +54,24 @@ UART_HandleTypeDef huart1;
 
 osThreadId PIDTaskHandle;
 osThreadId BluetoothTaskHandle;
+osMessageQId myBluetoothQueueHandle;
 /* USER CODE BEGIN PV */
-PID_t lInner,lOuter; 								//双环PID所需变量
-PID_t rInner,rOuter;                            	//双环PID所需变量
-int32_t lSpeed, lLocation, rSpeed, rLocation;   	//双环PID所需变量
-float x = 0,y = 0,L = 1.65f;                    	//目标坐标以及两轮轮距
-Pose_t current_pose = {0.0f, 0.0f, 0.0f};       	//里程计参数
-uint8_t new_data_flag = 0;                      	// 1表示有新坐标到来
-char rx_data[64];                               	// 串口接收缓冲
+PID_t lPID, rPID;
+int32_t lSpeed, lLocation, rSpeed, rLocation;
+float x = 0,y = 0,L = 1.65f;
+float Target;
+uint8_t new_data_flag = 0;    		  // 1表示有新坐标到来
+char rx_data[64];             		  // 串口接收缓冲
+uint8_t aRxBuffer;
+
+CarState_t current_state = CAR_STOP; 
+float base_speed = 50.0f;            
+float speed_step = 5.0f;             
+float lTarget = 0.0f;                
+float rTarget = 0.0f;                
+
+extern osMessageQId myBluetoothQueueHandle;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -80,8 +90,16 @@ void StartBluetoothTask(void const * argument);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void PID_Update(PID_t *p)                            //单环PID计算函数 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART1) {
+        osMessagePut(myBluetoothQueueHandle, (uint32_t)aRxBuffer, 0);
+        HAL_UART_Receive_IT(&huart1, &aRxBuffer, 1);
+    }
+}
+
+void PID_Update(PID_t *p,float target)
 {
+	p->Target = target;
 	p->Error1 = p->Error0;
 	p->Error0 = p->Target - p->Actual;
 	
@@ -100,10 +118,9 @@ void PID_Update(PID_t *p)                            //单环PID计算函数
 	
 	if (p->Out > p->OutMax) {p->Out = p->OutMax;}
 	if (p->Out < p->OutMin) {p->Out = p->OutMin;}
-	
 }
 
-PID_t lInner = {									 //左轮内环速度环PID参数
+PID_t lPID = {
 	.Kp = 1.0,
 	.Ki = 0.6,
 	.Kd = 0,
@@ -111,15 +128,7 @@ PID_t lInner = {									 //左轮内环速度环PID参数
 	.OutMin = -100,
 };
 
-PID_t lOuter = {									 //左轮外环位置环PID参数
-	.Kp = 0.4,
-	.Ki = 0,
-	.Kd = 0.2,
-	.OutMax = 100,
-	.OutMin = -100,
-};
-
-PID_t rInner = {
+PID_t rPID = {
 	.Kp = 1.0,
 	.Ki = 0.6,
 	.Kd = 0,
@@ -127,13 +136,6 @@ PID_t rInner = {
 	.OutMin = -100,
 };
 
-PID_t rOuter = {
-	.Kp = 0.4,
-	.Ki = 0,
-	.Kd = 0.2,
-	.OutMax = 100,
-	.OutMin = -100,
-};
 /* USER CODE END 0 */
 
 /**
@@ -174,6 +176,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
+  HAL_UART_Receive_IT(&huart1, &aRxBuffer, 1);
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -187,6 +190,11 @@ int main(void)
   /* USER CODE BEGIN RTOS_TIMERS */
   /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
+
+  /* Create the queue(s) */
+  /* definition and creation of myBluetoothQueue */
+  osMessageQDef(myBluetoothQueue, 16, uint8_t);
+  myBluetoothQueueHandle = osMessageCreate(osMessageQ(myBluetoothQueue), NULL);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -484,8 +492,8 @@ static void MX_GPIO_Init(void)
 //左轮PID
 int32_t lEncoder_Get(void) {
     int32_t temp;
-    temp = (short)__HAL_TIM_GET_COUNTER(&htim3);              				// 获取当前计数
-    __HAL_TIM_SET_COUNTER(&htim3, 0);                         				// 计数值清零
+    temp = (short)__HAL_TIM_GET_COUNTER(&htim3); // 获取当前计数
+    __HAL_TIM_SET_COUNTER(&htim3, 0);            // 计数值清�?
     return temp;
 }
 
@@ -493,7 +501,7 @@ void lPWM_SetCompare1(uint16_t Compare) {
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, Compare);
 }
 
-void lMotor_SetPWM(int8_t PWM)
+void lMotor_SetPWM(int16_t PWM)
 {
 	if (PWM >= 0)
 	{
@@ -508,30 +516,18 @@ void lMotor_SetPWM(int8_t PWM)
 		lPWM_SetCompare1(-PWM);
 	}
 }
-void lPIDCalculate(int32_t speed_delta)
-{
-    lSpeed = speed_delta;
-    lLocation += lSpeed;
 
-    lOuter.Actual=lLocation;
-    PID_Update(&lOuter);
-    lInner.Target=lOuter.Out;  
-      
-    lInner.Actual=lSpeed;
-    PID_Update(&lInner);
-    lMotor_SetPWM(lInner.Out);
-}
 //右轮PID
 int32_t rEncoder_Get(void) {
     int32_t temp;
-    temp = (short)__HAL_TIM_GET_COUNTER(&htim4);               				// 获取当前计数
-    __HAL_TIM_SET_COUNTER(&htim4, 0);                          				// 计数值清零
+    temp = (short)__HAL_TIM_GET_COUNTER(&htim4); // 获取当前计数
+    __HAL_TIM_SET_COUNTER(&htim4, 0);            // 计数值清�?
     return temp;
 }
 void rPWM_SetCompare1(uint16_t Compare) {
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, Compare);
 }
-void rMotor_SetPWM(int8_t PWM)
+void rMotor_SetPWM(int16_t PWM)
 {
 	if (PWM >= 0)
 	{
@@ -546,36 +542,6 @@ void rMotor_SetPWM(int8_t PWM)
 		rPWM_SetCompare1(-PWM);
 	}
 }
-
-void rPIDCalculate(int32_t speed_delta)										//双环PID计算函数
-{
-    rSpeed = speed_delta;
-    rLocation += rSpeed;
-
-    rOuter.Actual=rLocation;
-    PID_Update(&rOuter);
-    rInner.Target=rOuter.Out;  
-    
-    rInner.Actual=rSpeed;
-    PID_Update(&rInner);
-    rMotor_SetPWM(rInner.Out);
-}
-
-void Update_Odometry(int32_t delta_left, int32_t delta_right) {  			//里程计系统计算函数，计算出小车实时坐标和角度
-    float dL = (float)delta_left / 780.0f;
-    float dR = (float)delta_right / 780.0f;
-
-    float dD = (dL + dR) / 2.0f;     
-    float dTheta = (dL - dR) / L;
-
-    current_pose.x += dD * sinf(current_pose.theta + dTheta/2.0f);
-    current_pose.y += dD * cosf(current_pose.theta + dTheta/2.0f);
-    
-    current_pose.theta += dTheta;
-    
-    if (current_pose.theta > M_PI) current_pose.theta -= 2.0f * M_PI;
-    if (current_pose.theta < -M_PI) current_pose.theta += 2.0f * M_PI;
-}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartPIDTask */
@@ -589,51 +555,16 @@ void StartPIDTask(void const * argument)
 {
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
-  int base_step = 50;																//路径规划算法所必需的基步，以实现纯追踪算法条件之一：小车两轮速度始终成一定比例
   for(;;)
   {
-	int32_t dL = lEncoder_Get(); 													//获取每次左轮移动的微小距离
-    int32_t dR = rEncoder_Get();													//获取每次右轮移动的微小距离
-    Update_Odometry(dL, dR);														//里程计坐标角度计算
-	
-	float dx = x - current_pose.x;													
-    float dy = y - current_pose.y;													
-	float x_local = dx * cosf(current_pose.theta) - dy * sinf(current_pose.theta);  //本地坐标：始终以小车为原点，小车方向为y轴的坐标，实现坐标闭环的关键
-    float y_local = dx * sinf(current_pose.theta) + dy * cosf(current_pose.theta);  //本地坐标：始终以小车为原点，小车方向为y轴的坐标，实现坐标闭环的关键
-	float distance = sqrtf(x_local * x_local + y_local * y_local);					//本地距离：小车相对目标坐标的实时距离
-	
-	if (distance < 0.2f) {															//到达坐标，强制停止
-		lOuter.Target = lLocation;
-		rOuter.Target = rLocation;
-		lOuter.ErrorInt = 0;
-        rOuter.ErrorInt = 0;
-        lInner.ErrorInt = 0; 
-        rInner.ErrorInt = 0; 
-    }
-	else {
-		if (y_local >= fabsf(x_local)) {											//坐标在前方90°视角
-			float curvature = (2.0f * x_local) / (distance * distance);				//曲率，1/R，引入是为了让小车两轮子速度成比例，R涉及纯追踪算法
-			float left_ratio = 1.0f + (curvature * L / 2.0f);						//left_ratio/right_ratio为纯追踪算法比例系数
-			float right_ratio = 1.0f - (curvature * L / 2.0f);						//left_ratio/right_ratio为纯追踪算法比例系数
-			if (left_ratio > 2.0f) left_ratio = 2.0f;								//转弯限幅，防止了单边轮子速度过高导致抽搐或反转
-			if (left_ratio < 0.2f) left_ratio = 0.2f;								
-			if (right_ratio > 2.0f) right_ratio = 2.0f;
-			if (right_ratio < 0.2f) right_ratio = 0.2f;
-			lOuter.Target += left_ratio * base_step; 								//纯追踪算法条件之二：小测两轮距离成一定比例；路径规划算法，使小车两轮速度始终成一定比例
-			rOuter.Target += right_ratio * base_step; 								//纯追踪算法条件之二：小测两轮距离成一定比例；路径规划算法，使小车两轮速度始终成一定比例
-		}
-		else {																		//坐标不在前方90°视角，转弯直至目标坐标出现在前方90°视角
-			if (x_local > 0) {
-				lOuter.Target += 0.5f * base_step;
-				rOuter.Target -= 0.5f * base_step;
-			} else {               
-				lOuter.Target -= 0.5f * base_step;
-				rOuter.Target += 0.5f * base_step;
-			}
-		}
-	}
-    lPIDCalculate(dL);																//PID计算
-    rPIDCalculate(dR);
+	lPID.Actual = lEncoder_Get();  
+    rPID.Actual = rEncoder_Get();
+    
+    PID_Update(&lPID,lTarget);
+    PID_Update(&rPID,rTarget);
+	  
+	lMotor_SetPWM(lPID.Out);
+	rMotor_SetPWM(rPID.Out);
 	
 	osDelay(40);
   }
@@ -651,31 +582,69 @@ void StartBluetoothTask(void const * argument)
 {
   /* USER CODE BEGIN StartBluetoothTask */
   /* Infinite loop */
-  uint8_t rx_buf[1];
-  int i = 0;
+  osEvent event;
+  uint8_t rx_cmd;
+  
   for(;;)
   {
-    if(HAL_UART_Receive(&huart1, rx_buf, 1, 10) == HAL_OK) 							//手机蓝牙输入num1空格num2即可赋值给x和y让小车走到目标坐标
-    {
-        if(rx_buf[0] == '\r' || rx_buf[0] == '\n') 
-        {
-            rx_data[i] = '\0';
-            if(i > 0) 
-            {
-                char *endptr;
-                x = strtod(rx_data, &endptr);  
-                y = strtod(endptr, NULL);      
-				char buffer[64]; 
-				int len = sprintf(buffer, "%.2f,%.2f\n", x, y);
-				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, len, 100);
-            }
-            i = 0;
+    event = osMessageGet(myBluetoothQueueHandle, osWaitForever);
+	if (event.status == osEventMessage) {
+        rx_cmd = (uint8_t)event.value.v; 
+		switch(rx_cmd) {
+            case 'F': 
+                current_state = CAR_FORWARD;
+                break;
+            case 'B':
+                current_state = CAR_BACKWARD;
+                break;
+            case 'L': 
+                current_state = CAR_TURN_LEFT;
+                break;
+            case 'R': 
+                current_state = CAR_TURN_RIGHT;
+                break;
+            case 'S': 
+                current_state = CAR_STOP;
+                break;
+            case '+': 
+                if(current_state == CAR_FORWARD || current_state == CAR_BACKWARD) {
+                    base_speed += speed_step;
+                    if(base_speed > 1.5f) base_speed = 1.5f; 
+                }
+                break;
+            case '-': 
+                if(current_state == CAR_FORWARD || current_state == CAR_BACKWARD) {
+                    base_speed -= speed_step;
+                    if(base_speed < 0.2f) base_speed = 0.2f; 
+                }
+                break;
+            default:
+                break;
         }
-        else if(i < 63)
-        {
-            rx_data[i++] = rx_buf[0];
+		
+		switch(current_state) {
+            case CAR_STOP:
+                lTarget = 0.0f; 
+                rTarget = 0.0f;
+                break;
+            case CAR_FORWARD:
+                lTarget = base_speed;  
+                rTarget = base_speed;
+                break;
+            case CAR_BACKWARD:
+                lTarget = -base_speed; 
+                rTarget = -base_speed;
+                break;
+            case CAR_TURN_LEFT:
+                lTarget = -base_speed * 0.8f; 
+                rTarget = base_speed * 0.8f;
+                break;
+            case CAR_TURN_RIGHT:
+                lTarget = base_speed * 0.8f;  
+                rTarget = -base_speed * 0.8f;
+                break;
         }
-    }
+	}
     osDelay(1); 
   }
   /* USER CODE END StartBluetoothTask */

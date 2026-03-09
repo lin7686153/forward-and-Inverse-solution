@@ -72,12 +72,13 @@ typedef struct {
 	float OutMin;
 } PID_t;
 
-typedef struct {
-    float x;      
-    float y;      
-    float theta;  
-} Pose_t;
-
+typedef enum {
+    CAR_STOP = 0,
+    CAR_FORWARD,
+    CAR_BACKWARD,
+    CAR_TURN_LEFT,
+    CAR_TURN_RIGHT
+} CarState_t;
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
